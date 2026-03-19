@@ -1,0 +1,79 @@
+name: Build and Deploy Container
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+
+    - name: Create ACR (Terraform)
+      working-directory: infra/acr
+      run: |
+        terraform init -input=false
+        terraform apply -auto-approve -input=false
+
+    - name: Read ACR outputs
+      id: acr_outputs
+      run: |
+        ACR_NAME=$(terraform -chdir=infra/acr output -raw acr_name)
+        ACR_LOGIN_SERVER=$(terraform -chdir=infra/acr output -raw acr_login_server)
+        echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+        echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
+
+    - name: Get ACR credentials
+      run: |
+        echo "Getting ACR credentials for $ACR_NAME"
+        ACR_PASSWORD=$(az acr credential show -n $ACR_NAME --query "passwords[0].value" -o tsv)
+        ACR_USERNAME=$(az acr credential show -n $ACR_NAME --query "username" -o tsv)
+        echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_ENV
+        echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_ENV
+
+    - name: Log in to ACR (Docker)
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.ACR_LOGIN_SERVER }}
+        username: ${{ env.ACR_USERNAME }}
+        password: ${{ env.ACR_PASSWORD }}
+
+    - name: Build and push image
+      run: |
+        IMAGE_TAG=${GITHUB_SHA::8}
+        IMAGE_NAME=${{ env.ACR_NAME }}
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$IMAGE_TAG .
+        docker push ${{ env.ACR_LOGIN_SERVER }}/$IMAGE_NAME:$IMAGE_TAG
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+    - name: Deploy to Azure Container Instances (Terraform)
+      working-directory: infra/aci
+      env:
+        ACR_LOGIN_SERVER: ${{ env.ACR_LOGIN_SERVER }}
+        ACR_USERNAME: ${{ env.ACR_USERNAME }}
+        ACR_PASSWORD: ${{ env.ACR_PASSWORD }}
+        IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        IMAGE_NAME: ${{ env.ACR_NAME }}
+      run: |
+        terraform init -input=false
+        terraform apply -auto-approve -input=false \
+          -var "acr_login_server=${ACR_LOGIN_SERVER}" \
+          -var "acr_username=${ACR_USERNAME}" \
+          -var "acr_password=${ACR_PASSWORD}" \
+          -var "image_tag=${IMAGE_TAG}" \
+          -var "image_name=${IMAGE_NAME}" \
+          -var "prefix=demo" -var "resource_group_name=demo-acr-rg" -var "location=eastus"
